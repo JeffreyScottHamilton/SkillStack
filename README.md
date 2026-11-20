@@ -1,6 +1,6 @@
 # Skill Stacks
 
-A small, curated catalog of skills for Claude Code: search, read what each one does, and copy the install command. Built with Next.js (App Router), TypeScript and Tailwind CSS.
+A searchable catalog of popular skills for Claude Code. Each row links straight to the skill's source on GitHub. Built with Next.js (App Router), TypeScript and Tailwind CSS.
 
 ## Local setup
 
@@ -22,28 +22,23 @@ Node 22 is expected. Optionally copy `.env.example` to `.env.local` (see "Star c
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm test` | Unit tests (`vitest run`) |
 
-## Adding a skill
+## The catalog
 
-1. Add an entry to `SKILLS` in `src/data/catalog.ts` (follow the `Skill` type there).
-2. **Original skill:** add `skills/<slug>/SKILL.md` with YAML frontmatter (`name`, `description`, `argument-hint`) and a Markdown body. It is rendered on the detail page and offered as a download.
-3. **Upstream skill:** verify the `SKILL.md` path in the source repo, write an original one-sentence summary and "when to use" bullets, link to the source, and do not copy upstream content unless its license allows it (then include attribution). Only list install methods you have verified in the upstream docs.
+- **What's included:** 1,800+ skills from about 65 popular GitHub repositories, plus the three original skills in `skills/` (`review-my-diff`, `write-pr-description`, `draft-release-notes`). Every entry points at a real `SKILL.md` in its repository.
+- **Grouped in 12 categories:** Coding & engineering, UI & design, Video, audio & animation, AI & ML, Cloud & DevOps, Security, Docs & office, Writing, marketing & SEO, Product & business, Research & science, Workflow & productivity, Games & 3D. Filter with the category chips (`?cat=<id>`) or search everything (`?q=`).
+- **Rows link to GitHub.** Clicking a skill opens its folder in the source repository in a new tab. The site has no detail pages or install instructions; follow the upstream repository's own docs.
+- **Summaries** are the first sentence of each skill's upstream `description` frontmatter.
+- **Data** lives in `src/data/skills.json` (fields: `id`, `name`, `summary`, `category`, `repo`, `url`); categories, search aliases and types are in `src/data/catalog.ts`.
 
-Claude Code looks for personal skills in `~/.claude/skills/<skill-name>/SKILL.md` and project skills in `.claude/skills/<skill-name>/SKILL.md`, and you invoke one with `/skill-name`. Plugin skills use `/plugin-name:skill-name`. See https://code.claude.com/docs/en/skills.
+Claude Code looks for personal skills in `~/.claude/skills/<skill-name>/SKILL.md` and project skills in `.claude/skills/<skill-name>/SKILL.md`. See https://code.claude.com/docs/en/skills.
 
 ## Star counts
 
-Star counts are the GitHub star count of the skill's repository, not a rating of the skill. They are fetched server-side from the GitHub REST API, deduplicated per repo, and revalidated every 3600 seconds. An optional `GITHUB_TOKEN` (server-only, never sent to the browser or logged) raises the rate limit. On failure (non-2xx, timeout, bad JSON) the last known value is shown, or an em dash (—) if there is none. Counts are never fabricated. `GITHUB_API_BASE` can override the API host, which is handy for testing the failure path.
+Star counts are the GitHub star count of the skill's **repository**, not of the individual skill, so every skill from the same repository shows the same number. They are fetched server-side in batches from the GitHub search API (`/search/repositories?q=repo:a/b+repo:c/d…`, each query at most 250 characters), so a full refresh takes only a few requests. Results are revalidated every 3600 seconds. If a batch fails or a repository is missing from the results, the last known value is shown, or an em dash (—) if there is none. Counts are never fabricated. A `GITHUB_TOKEN` (server-only, never sent to the browser or logged) raises the rate limit and is recommended on Vercel. `GITHUB_API_BASE` can override the API host, which is handy for testing the failure path.
 
 ## Deploy to Vercel
 
 1. Import the GitHub repository in Vercel.
 2. Set the production branch to `main`.
 3. Preview deployments come from the Git integration for other branches and pull requests.
-4. Optionally set the `GITHUB_TOKEN` environment variable.
-
-## Upstream sources
-
-| Skill | Repository | Path |
-| --- | --- | --- |
-| Caveman | `JuliusBrussee/caveman` | `skills/caveman` |
-| Karpathy Guidelines | `multica-ai/andrej-karpathy-skills` (formerly `forrestchang/andrej-karpathy-skills`) | `skills/karpathy-guidelines` |
+4. Set the `GITHUB_TOKEN` environment variable (recommended; a token with no scopes is enough for public star counts).

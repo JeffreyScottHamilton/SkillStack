@@ -14,7 +14,7 @@ const sourceSerif = Source_Serif_4({
 
 export const metadata: Metadata = {
   title: SITE.name,
-  description: "A small, curated list of skills for Claude Code.",
+  description: "Search 1,800+ popular skills for Claude Code, grouped by category, each linking to its GitHub source.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

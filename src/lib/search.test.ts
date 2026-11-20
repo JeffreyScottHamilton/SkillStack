@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { SKILLS } from "@/data/catalog";
-import { normalize, searchSkills } from "./search";
+import { filterSkills, normalize } from "./search";
 
-const slugs = (q: string) => searchSkills(SKILLS, q).map((s) => s.slug);
+const ids = (q: string) => filterSkills(SKILLS, q).map((s) => s.id);
 
 describe("normalize", () => {
   it("collapses case, spaces and punctuation", () => {
@@ -12,26 +12,36 @@ describe("normalize", () => {
   });
 });
 
-describe("searchSkills", () => {
+describe("filterSkills", () => {
   it.each(["caveman", "cave man", "CAVE-MAN"])("finds caveman for %s", (q) => {
-    expect(slugs(q)).toContain("caveman");
+    expect(ids(q)).toContain("juliusbrussee/caveman/caveman");
   });
   it.each(["Karpathy", "Kaparthy"])("finds karpathy-guidelines for %s", (q) => {
-    expect(slugs(q)).toEqual(["karpathy-guidelines"]);
+    expect(ids(q)).toContain("multica-ai/andrej-karpathy-skills/karpathy-guidelines");
   });
   it("matches words in any order", () => {
-    expect(slugs("notes release")).toContain("draft-release-notes");
+    expect(ids("notes release")).toContain("jeffreyscotthamilton/skillstack/draft-release-notes");
+  });
+  it("matches repo owner and name", () => {
+    expect(ids("andrej-karpathy-skills")).toContain(
+      "multica-ai/andrej-karpathy-skills/karpathy-guidelines",
+    );
+  });
+  it("matches category labels", () => {
+    const hits = filterSkills(SKILLS, "Games & 3D");
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits.some((s) => s.category === "games")).toBe(true);
   });
   it("returns nothing for nonsense", () => {
-    expect(slugs("zzz")).toEqual([]);
+    expect(ids("zzqqxxj")).toEqual([]);
   });
   it("returns nothing for punctuation-only query", () => {
-    expect(slugs("!!!")).toEqual([]);
+    expect(ids("!!!")).toEqual([]);
   });
   it("returns all for whitespace-only query", () => {
-    expect(slugs("   ")).toHaveLength(5);
+    expect(ids("   ")).toHaveLength(SKILLS.length);
   });
   it("returns all for empty query", () => {
-    expect(slugs("")).toHaveLength(5);
+    expect(ids("")).toHaveLength(SKILLS.length);
   });
 });
