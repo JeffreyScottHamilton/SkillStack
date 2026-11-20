@@ -135,11 +135,8 @@ export default async function SkillPage({
         </div>
       ))}
 
-      {skill.slug === "karpathy-guidelines" && (
-        <p className="mb-5 text-sm text-muted">
-          The upstream README uses the original forrestchang/andrej-karpathy-skills name;
-          GitHub redirects it to multica-ai/andrej-karpathy-skills.
-        </p>
+      {skill.installNote && (
+        <p className="mb-5 text-sm text-muted">{skill.installNote}</p>
       )}
 
       {inv && (

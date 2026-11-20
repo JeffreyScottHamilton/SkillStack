@@ -25,6 +25,12 @@ describe("searchSkills", () => {
   it("returns nothing for nonsense", () => {
     expect(slugs("zzz")).toEqual([]);
   });
+  it("returns nothing for punctuation-only query", () => {
+    expect(slugs("!!!")).toEqual([]);
+  });
+  it("returns all for whitespace-only query", () => {
+    expect(slugs("   ")).toHaveLength(5);
+  });
   it("returns all for empty query", () => {
     expect(slugs("")).toHaveLength(5);
   });

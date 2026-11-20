@@ -22,7 +22,7 @@ function haystackParts(skill: Skill): string[] {
 
 export function searchSkills(skills: Skill[], query: string): Skill[] {
   const q = normalize(query);
-  if (!q) return skills;
+  if (!q) return query.trim() === "" ? skills : [];
   const tokens = query
     .split(/\s+/)
     .map(normalize)

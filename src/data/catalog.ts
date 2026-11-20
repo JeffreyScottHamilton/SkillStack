@@ -20,6 +20,8 @@ export type Skill = {
   branch: string;
   license?: string;
   install?: InstallMethod[];
+  /** Optional one-line note rendered under the install commands. */
+  installNote?: string;
   hasCompanionFiles: boolean;
 };
 
@@ -95,6 +97,8 @@ export const SKILLS: Skill[] = [
         docsUrl: "https://github.com/multica-ai/andrej-karpathy-skills#install",
       },
     ],
+    installNote:
+      "The upstream README uses the original forrestchang/andrej-karpathy-skills name; GitHub redirects it to multica-ai/andrej-karpathy-skills.",
     hasCompanionFiles: false,
   },
   {
