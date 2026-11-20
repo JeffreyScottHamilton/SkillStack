@@ -1,17 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-type Item = { full_name: string; stargazers_count: unknown };
-const ok = (items: Item[]) =>
-  new Response(JSON.stringify({ total_count: items.length, items }), { status: 200 });
+type Init = RequestInit & { next?: { revalidate?: number } };
 
 async function load() {
   vi.resetModules();
-  return (await import("./stars")).getStarCounts;
+  return await import("./stars");
 }
 
 const call = (f: ReturnType<typeof vi.fn>, i: number) =>
-  f.mock.calls[i] as unknown as [string, RequestInit];
-const qOf = (url: string) => new URL(url).searchParams.get("q") ?? "";
+  f.mock.calls[i] as unknown as [string, Init];
+const bodyOf = (init: Init) => JSON.parse(String(init.body)) as { query: string };
+
+/** Answers every alias in the query with `stars(owner/name)`. */
+function graphqlMock(stars: (key: string) => number | null = () => 7) {
+  return vi.fn(async (_url: string, init: Init) => {
+    const { query } = bodyOf(init);
+    const data: Record<string, unknown> = {};
+    for (const m of query.matchAll(/(r\d+): repository\(owner: ?("[^"]*"), ?name: ?("[^"]*")\)/g)) {
+      const key = `${JSON.parse(m[2])}/${JSON.parse(m[3])}`.toLowerCase();
+      const v = stars(key);
+      data[m[1]] = v === null ? null : { stargazerCount: v };
+    }
+    return new Response(JSON.stringify({ data }), { status: 200 });
+  });
+}
+
+const repos = (n: number) =>
+  Array.from({ length: n }, (_, i) => ({ owner: `Owner${i}`, name: `repo-${i}`, stars: i }));
 
 beforeEach(() => {
   vi.stubEnv("GITHUB_TOKEN", "");
@@ -22,135 +37,98 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe("getStarCounts", () => {
-  it("uses the batched search endpoint and maps full_name to stargazers_count", async () => {
-    const f = vi.fn(async () =>
-      ok([
-        { full_name: "A/b", stargazers_count: 42 },
-        { full_name: "c/D", stargazers_count: 5 },
-      ]),
-    );
+describe("refreshStars", () => {
+  it("makes no request without a token and returns the snapshot", async () => {
+    const f = vi.fn();
     vi.stubGlobal("fetch", f);
-    const get = await load();
-    const r = await get([
-      { owner: "A", name: "b" },
-      { owner: "c", name: "d" },
+    const { refreshStars, hasLiveStars } = await load();
+    expect(hasLiveStars()).toBe(false);
+    expect(await refreshStars(repos(2))).toEqual({
+      stars: { "owner0/repo-0": 0, "owner1/repo-1": 1 },
+      live: false,
+    });
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("queries GraphQL with aliases, auth header and hourly revalidation", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "tkn");
+    const f = graphqlMock((k) => (k === "a/b" ? 42 : 5));
+    vi.stubGlobal("fetch", f);
+    const { refreshStars, hasLiveStars } = await load();
+    expect(hasLiveStars()).toBe(true);
+    const r = await refreshStars([
+      { owner: "A", name: "b", stars: 1 },
+      { owner: "c", name: "d", stars: 2 },
     ]);
-    expect(r).toEqual({ "a/b": 42, "c/d": 5 });
+    expect(r).toEqual({ stars: { "a/b": 42, "c/d": 5 }, live: true });
     expect(f).toHaveBeenCalledTimes(1);
     const [url, init] = call(f, 0);
-    expect(url.startsWith("https://api.github.com/search/repositories?")).toBe(true);
-    expect(new URL(url).searchParams.get("per_page")).toBe("100");
-    expect(qOf(url)).toBe("repo:a/b repo:c/d");
-    expect((init as RequestInit & { next?: { revalidate?: number } }).next?.revalidate).toBe(3600);
+    expect(url).toBe("https://api.github.com/graphql");
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer tkn");
+    expect(init.next?.revalidate).toBe(3600);
+    const { query } = bodyOf(init);
+    expect(query).toContain('r0: repository(owner: "A", name: "b") { stargazerCount }');
+    expect(query).toContain('r1: repository(owner: "c", name: "d") { stargazerCount }');
+    expect(query).not.toContain("tkn");
   });
 
-  it("returns 0 rather than null", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ok([{ full_name: "a/b", stargazers_count: 0 }])));
-    const get = await load();
-    expect((await get([{ owner: "a", name: "b" }]))["a/b"]).toBe(0);
-  });
-
-  it("returns null for a repo missing from the results", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => ok([{ full_name: "a/b", stargazers_count: 3 }])));
-    const get = await load();
-    expect(
-      await get([
-        { owner: "a", name: "b" },
-        { owner: "x", name: "y" },
-      ]),
-    ).toEqual({ "a/b": 3, "x/y": null });
-  });
-
-  it("dedupes repos case-insensitively", async () => {
-    const f = vi.fn(async () => ok([{ full_name: "Foo/Bar", stargazers_count: 1 }]));
-    vi.stubGlobal("fetch", f);
-    const get = await load();
-    const r = await get([
-      { owner: "Foo", name: "Bar" },
-      { owner: "foo", name: "bar" },
-    ]);
-    expect(f).toHaveBeenCalledTimes(1);
-    expect(qOf(call(f, 0)[0])).toBe("repo:foo/bar");
-    expect(r).toEqual({ "foo/bar": 1 });
-  });
-
-  it("returns null on non-2xx with no prior value", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("no", { status: 403 })));
-    const get = await load();
-    expect((await get([{ owner: "a", name: "b" }]))["a/b"]).toBeNull();
-  });
-
-  it("falls back to the last known value when a chunk fails", async () => {
-    const f = vi
-      .fn()
-      .mockResolvedValueOnce(ok([{ full_name: "a/b", stargazers_count: 7 }]))
-      .mockRejectedValueOnce(new Error("down"));
-    vi.stubGlobal("fetch", f);
-    const get = await load();
-    const repo = [{ owner: "a", name: "b" }];
-    expect((await get(repo))["a/b"]).toBe(7);
-    expect((await get(repo))["a/b"]).toBe(7);
-  });
-
-  it("chunks queries so each q is at most 250 characters", async () => {
-    const repos = Array.from({ length: 66 }, (_, i) => ({
-      owner: `owner-number-${i}`,
-      name: `some-repository-${i}`,
-    }));
-    const f = vi.fn(async (url: string) => {
-      const names = qOf(url)
-        .split(" ")
-        .map((t) => t.replace(/^repo:/, ""));
-      return ok(names.map((n) => ({ full_name: n, stargazers_count: 1 })));
-    });
-    vi.stubGlobal("fetch", f);
-    const get = await load();
-    const r = await get(repos);
-    expect(f.mock.calls.length).toBeGreaterThan(1);
-    const seen: string[] = [];
-    for (let i = 0; i < f.mock.calls.length; i++) {
-      const q = qOf(call(f, i)[0]);
-      expect(q.length).toBeLessThanOrEqual(250);
-      seen.push(...q.split(" "));
-    }
-    expect(seen).toHaveLength(66);
-    expect(Object.values(r).every((v) => v === 1)).toBe(true);
-  });
-
-  it("only fails the affected chunk", async () => {
-    const repos = Array.from({ length: 30 }, (_, i) => ({
-      owner: `owner-number-${i}`,
-      name: `some-repository-${i}`,
-    }));
-    let n = 0;
-    const f = vi.fn(async (url: string) => {
-      if (n++ === 0) return new Response("rate limited", { status: 403 });
-      const names = qOf(url)
-        .split(" ")
-        .map((t) => t.replace(/^repo:/, ""));
-      return ok(names.map((x) => ({ full_name: x, stargazers_count: 2 })));
-    });
-    vi.stubGlobal("fetch", f);
-    const get = await load();
-    const r = await get(repos);
-    const vals = Object.values(r);
-    expect(vals).toContain(null);
-    expect(vals).toContain(2);
-  });
-
-  it("sends Authorization only when GITHUB_TOKEN is set", async () => {
-    const f = vi.fn(async () => ok([{ full_name: "a/b", stargazers_count: 1 }]));
-    vi.stubGlobal("fetch", f);
-    let get = await load();
-    await get([{ owner: "a", name: "b" }]);
-    const h1 = call(f, 0)[1].headers as Record<string, string>;
-    expect(h1.Authorization).toBeUndefined();
-
+  it("honours GITHUB_API_BASE", async () => {
     vi.stubEnv("GITHUB_TOKEN", "tkn");
-    get = await load();
-    await get([{ owner: "a", name: "b" }]);
-    const h2 = call(f, 1)[1].headers as Record<string, string>;
-    expect(h2.Authorization).toBe("Bearer tkn");
+    vi.stubEnv("GITHUB_API_BASE", "http://127.0.0.1:9");
+    const f = graphqlMock();
+    vi.stubGlobal("fetch", f);
+    const { refreshStars } = await load();
+    await refreshStars(repos(1));
+    expect(call(f, 0)[0]).toBe("http://127.0.0.1:9/graphql");
+  });
+
+  it("chunks at 100 repositories per query", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "tkn");
+    const f = graphqlMock(() => 9);
+    vi.stubGlobal("fetch", f);
+    const { refreshStars } = await load();
+    const { stars: r } = await refreshStars(repos(250));
+    expect(f).toHaveBeenCalledTimes(3);
+    const sizes = [0, 1, 2].map((i) => (bodyOf(call(f, i)[1]).query.match(/stargazerCount/g) ?? []).length);
+    expect(sizes.sort((a, b) => b - a)).toEqual([100, 100, 50]);
+    expect(Object.keys(r)).toHaveLength(250);
+    expect(Object.values(r).every((v) => v === 9)).toBe(true);
+  });
+
+  it("keeps the snapshot for missing repos and failed chunks", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "tkn");
+    let n = 0;
+    const ok = graphqlMock((k) => (k === "owner1/repo-1" ? null : 1000));
+    const f = vi.fn(async (url: string, init: Init) => {
+      if (n++ === 1) return new Response("rate limited", { status: 502 });
+      return ok(url, init);
+    });
+    vi.stubGlobal("fetch", f);
+    const { refreshStars } = await load();
+    const { stars: r, live } = await refreshStars(repos(200));
+    expect(live).toBe(true);
+    expect(r["owner0/repo-0"]).toBe(1000);
+    expect(r["owner1/repo-1"]).toBe(1); // null in response -> snapshot
+    const failedChunk = Object.entries(r).filter(([, v]) => v !== 1000);
+    // the second chunk (100 repos) failed and keeps snapshot values, plus owner1
+    expect(failedChunk).toHaveLength(101);
+  });
+
+  it("keeps the snapshot when fetch throws or the payload is malformed", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "tkn");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("down")));
+    let { refreshStars } = await load();
+    expect(await refreshStars(repos(2))).toEqual({
+      stars: { "owner0/repo-0": 0, "owner1/repo-1": 1 },
+      live: false,
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ data: { r0: { stargazerCount: "x" } } }))),
+    );
+    ({ refreshStars } = await load());
+    expect((await refreshStars(repos(1))).stars).toEqual({ "owner0/repo-0": 0 });
   });
 });

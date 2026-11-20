@@ -1,33 +1,34 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
-import type { CatalogSkill, CategoryId } from "@/data/catalog";
-import { CATEGORIES, SKILLS, repoKey } from "@/data/catalog";
-import { filterSkills } from "@/lib/search";
+import type { CatalogSkill, CategoryId, HomeData, SearchResult } from "@/lib/categories";
+import { CATEGORIES, CATEGORY_LABELS, PAGE_SIZE, isCategoryId } from "@/lib/categories";
 import { StarCount } from "./StarCount";
 import { StarIcon } from "./StarIcon";
 
-/** Rows shown per section before "Show all" when nothing is filtered. */
-const PREVIEW_ROWS = 8;
+const DEBOUNCE_MS = 150;
 
 const numberFormat = new Intl.NumberFormat("en-US");
+const fmt = (n: number) => numberFormat.format(n);
 
-function isCategoryId(v: string | null): v is CategoryId {
-  return CATEGORIES.some((c) => c.id === v);
+function resultKey(q: string, cat: CategoryId | null): string {
+  return `${q}\n${cat ?? ""}`;
 }
 
-type ViewProps = {
-  stars: Record<string, number | null>;
-  query: string;
-  category?: CategoryId | null;
-  kbdLabel?: string;
-  inputRef?: React.Ref<HTMLInputElement>;
-  onQueryChange?: (value: string) => void;
-  onCategoryChange?: (value: CategoryId | null) => void;
-  onShortcut?: (value: string) => void;
-  onClear?: () => void;
-};
+function buildUrl(q: string, cat: CategoryId | null): string {
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (cat) params.set("cat", cat);
+  const s = params.toString();
+  return s ? `/?${s}` : "/";
+}
+
+function apiUrl(q: string, cat: CategoryId | null, offset: number): string {
+  const params = new URLSearchParams({ offset: String(offset), limit: String(PAGE_SIZE) });
+  if (q) params.set("q", q);
+  if (cat) params.set("cat", cat);
+  return `/api/skills?${params}`;
+}
 
 function ExternalIcon() {
   return (
@@ -49,7 +50,7 @@ function ExternalIcon() {
   );
 }
 
-function SkillRow({ skill, stars }: { skill: CatalogSkill; stars: number | null | undefined }) {
+function SkillRow({ skill, showCategory }: { skill: CatalogSkill; showCategory: boolean }) {
   return (
     <li>
       <a
@@ -63,11 +64,17 @@ function SkillRow({ skill, stars }: { skill: CatalogSkill; stars: number | null 
           <span className="line-clamp-2 text-sm text-muted">{skill.summary}</span>
           <span className="mt-1 block truncate text-xs text-muted/80">
             {skill.repo.owner}/{skill.repo.name}
+            {showCategory && (
+              <>
+                <span aria-hidden="true"> · </span>
+                <span className="text-terracotta/90">{CATEGORY_LABELS[skill.category]}</span>
+              </>
+            )}
           </span>
         </span>
         <span className="flex shrink-0 items-center gap-1.5 text-sm text-muted">
           <StarIcon />
-          <StarCount value={stars} />
+          <StarCount value={skill.stars} />
           <span className="ml-2">
             <ExternalIcon />
           </span>
@@ -78,41 +85,156 @@ function SkillRow({ skill, stars }: { skill: CatalogSkill; stars: number | null 
   );
 }
 
-export function CatalogView({
-  stars,
-  query: q,
-  category = null,
-  kbdLabel = "Ctrl K",
-  inputRef,
-  onQueryChange,
-  onCategoryChange,
-  onShortcut,
-  onClear,
-}: ViewProps) {
-  const [expanded, setExpanded] = useState<Set<CategoryId>>(() => new Set());
-  const matches = filterSkills(SKILLS, q);
-  const results = category ? matches.filter((s) => s.category === category) : matches;
-  const filtered = q.trim() !== "" || category !== null;
+function SkillList({ items, showCategory }: { items: CatalogSkill[]; showCategory: boolean }) {
+  return (
+    <ul className="divide-y divide-line border-b border-line">
+      {items.map((s) => (
+        <SkillRow key={s.id} skill={s} showCategory={showCategory} />
+      ))}
+    </ul>
+  );
+}
 
-  const byCategory = new Map<CategoryId, CatalogSkill[]>();
-  for (const s of results) {
-    const list = byCategory.get(s.category);
-    if (list) list.push(s);
-    else byCategory.set(s.category, [s]);
+type ResultState = SearchResult & { key: string; error: boolean };
+
+type Props = {
+  initialQuery: string;
+  initialCategory: CategoryId | null;
+  /** Server-rendered first page for the initial q/cat; null on the home view. */
+  initialResult: SearchResult | null;
+  home: HomeData;
+  starsLabel: string;
+};
+
+export function Catalog({ initialQuery, initialCategory, initialResult, home, starsLabel }: Props) {
+  const [input, setInput] = useState(initialQuery);
+  const [query, setQuery] = useState(initialQuery);
+  const [cat, setCat] = useState<CategoryId | null>(initialCategory);
+  const [res, setRes] = useState<ResultState>(() => ({
+    key: initialResult ? resultKey(initialQuery, initialCategory) : "",
+    error: false,
+    total: initialResult?.total ?? 0,
+    counts: initialResult?.counts ?? home.counts,
+    items: initialResult?.items ?? [],
+  }));
+  const [more, setMore] = useState<{ loading: boolean; error: boolean }>({
+    loading: false,
+    error: false,
+  });
+  const [isMac, setIsMac] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const isHome = query.trim() === "" && cat === null;
+  const key = resultKey(query, cat);
+  const current = !isHome && res.key === key;
+  const loading = !isHome && res.key !== key;
+
+  useEffect(() => {
+    // Platform is only known on the client; neutral hint until mounted.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setIsMac(/Mac|iPhone|iPad/i.test(navigator.platform));
+  }, []);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        inputRef.current?.focus();
+      }
+    }
+    function onPop() {
+      const p = new URLSearchParams(window.location.search);
+      const q = p.get("q") ?? "";
+      const c = p.get("cat");
+      setInput(q);
+      setQuery(q);
+      setCat(isCategoryId(c) ? c : null);
+    }
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("popstate", onPop);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("popstate", onPop);
+    };
+  }, []);
+
+  // Typing: commit the query and update ?q= (replace) after a short pause.
+  useEffect(() => {
+    if (input === query) return;
+    const t = setTimeout(() => {
+      setQuery(input);
+      window.history.replaceState(null, "", buildUrl(input, cat));
+    }, DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [input, query, cat]);
+
+  // Fetch the first page whenever the committed query/category changes.
+  const resKey = res.key;
+  useEffect(() => {
+    if (isHome || resKey === key) return;
+    const ctrl = new AbortController();
+    fetch(apiUrl(query, cat, 0), { signal: ctrl.signal })
+      .then((r) => {
+        if (!r.ok) throw new Error(`status ${r.status}`);
+        return r.json() as Promise<SearchResult>;
+      })
+      .then((data) => {
+        setRes({ ...data, key, error: false });
+        setMore({ loading: false, error: false });
+      })
+      .catch((err: unknown) => {
+        if (ctrl.signal.aborted) return;
+        void err;
+        setRes((prev) => ({ ...prev, key, error: true, total: 0, items: [] }));
+      });
+    return () => ctrl.abort();
+  }, [isHome, key, resKey, query, cat]);
+
+  function navigate(q: string, c: CategoryId | null) {
+    setInput(q);
+    setQuery(q);
+    setCat(c);
+    window.history.pushState(null, "", buildUrl(q, c));
   }
-  const matchCounts = new Map<CategoryId, number>();
-  for (const s of matches) matchCounts.set(s.category, (matchCounts.get(s.category) ?? 0) + 1);
 
-  const countLine = filtered
-    ? `${numberFormat.format(results.length)} ${results.length === 1 ? "match" : "matches"}`
-    : `${numberFormat.format(results.length)} skills`;
+  async function loadMore() {
+    const k = key;
+    setMore({ loading: true, error: false });
+    try {
+      const r = await fetch(apiUrl(query, cat, res.items.length));
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      const data = (await r.json()) as SearchResult;
+      setRes((prev) => {
+        if (prev.key !== k) return prev;
+        const seen = new Set(prev.items.map((s) => s.id));
+        return { ...prev, items: [...prev.items, ...data.items.filter((s) => !seen.has(s.id))] };
+      });
+      setMore({ loading: false, error: false });
+    } catch {
+      setMore({ loading: false, error: true });
+    }
+  }
+
+  const counts = isHome ? home.counts : res.counts;
+  const allCount = Object.values(counts).reduce((a, b) => a + b, 0);
+  const homeTotal = Object.values(home.counts).reduce((a, b) => a + b, 0);
+
+  const countLine = isHome
+    ? `${fmt(homeTotal)} skills`
+    : loading
+      ? "Searching…"
+      : res.error
+        ? "Couldn't load results."
+        : `${fmt(res.total)} ${res.total === 1 ? "match" : "matches"}`;
 
   const chipClass = (active: boolean) =>
-    `rounded-full border px-3 py-1 text-sm ${
+    `shrink-0 whitespace-nowrap rounded-full border px-3 py-1 text-sm ${
       active
         ? "border-terracotta bg-terracotta text-white"
         : "border-line bg-surface text-ink hover:border-terracotta"
     }`;
+
+  const linkClass = "rounded text-sm text-terracotta hover:text-terracotta-hover";
 
   return (
     <div>
@@ -134,8 +256,8 @@ export function CatalogView({
         <input
           ref={inputRef}
           type="search"
-          value={q}
-          onChange={(e) => onQueryChange?.(e.target.value)}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
           placeholder="Search skills…"
           aria-label="Search skills"
           autoComplete="off"
@@ -146,46 +268,41 @@ export function CatalogView({
           aria-hidden="true"
           className="pointer-events-none absolute right-3 top-1/2 hidden -translate-y-1/2 rounded-md bg-ivory px-2 py-1 font-sans text-xs text-muted sm:block"
         >
-          {kbdLabel}
+          {isMac ? "⌘ K" : "Ctrl K"}
         </kbd>
       </div>
 
       <div className="mt-4 flex gap-8 text-sm text-terracotta">
-        <button
-          type="button"
-          onClick={() => onShortcut?.("Caveman")}
-          className="rounded hover:text-terracotta-hover"
-        >
+        <button type="button" onClick={() => navigate("Caveman", null)} className="rounded hover:text-terracotta-hover">
           Caveman
         </button>
-        <button
-          type="button"
-          onClick={() => onShortcut?.("Karpathy")}
-          className="rounded hover:text-terracotta-hover"
-        >
+        <button type="button" onClick={() => navigate("Karpathy", null)} className="rounded hover:text-terracotta-hover">
           Karpathy
         </button>
       </div>
 
-      <div className="mt-6 flex flex-wrap gap-2" role="group" aria-label="Filter by category">
+      <div
+        className="-mx-4 mt-6 flex gap-2 overflow-x-auto px-4 pb-1 sm:mx-0 sm:flex-wrap sm:overflow-visible sm:px-0"
+        role="group"
+        aria-label="Filter by category"
+      >
         <button
           type="button"
-          aria-pressed={category === null}
-          onClick={() => onCategoryChange?.(null)}
-          className={chipClass(category === null)}
+          aria-pressed={cat === null}
+          onClick={() => navigate(input, null)}
+          className={chipClass(cat === null)}
         >
-          All <span className="opacity-70">{numberFormat.format(matches.length)}</span>
+          All <span className="opacity-70">{fmt(allCount)}</span>
         </button>
         {CATEGORIES.map((c) => (
           <button
             key={c.id}
             type="button"
-            aria-pressed={category === c.id}
-            onClick={() => onCategoryChange?.(category === c.id ? null : c.id)}
-            className={chipClass(category === c.id)}
+            aria-pressed={cat === c.id}
+            onClick={() => navigate(input, cat === c.id ? null : c.id)}
+            className={chipClass(cat === c.id)}
           >
-            {c.label}{" "}
-            <span className="opacity-70">{numberFormat.format(matchCounts.get(c.id) ?? 0)}</span>
+            {c.label} <span className="opacity-70">{fmt(counts[c.id] ?? 0)}</span>
           </button>
         ))}
       </div>
@@ -197,106 +314,88 @@ export function CatalogView({
       <div className="mt-10 flex items-end justify-between gap-4 border-b border-line pb-2 text-xs text-muted">
         <span className="text-sm text-ink">{countLine}</span>
         <span className="text-right">
-          <span className="block">GitHub stars</span>
+          <span className="block">{starsLabel}</span>
           <span className="block">Stars are for the whole repository, not the individual skill.</span>
         </span>
       </div>
 
-      {results.length === 0 ? (
+      {isHome ? (
+        <>
+          <section aria-labelledby="popular" className="mt-10">
+            <h2 id="popular" className="border-b border-line pb-2 font-serif text-xl font-semibold">
+              Most popular
+            </h2>
+            <SkillList items={home.popular} showCategory />
+          </section>
+          {home.sections.map((sec) => (
+            <section key={sec.id} aria-labelledby={`cat-${sec.id}`} className="mt-10">
+              <h2
+                id={`cat-${sec.id}`}
+                className="flex items-baseline justify-between gap-4 border-b border-line pb-2 font-serif text-xl font-semibold"
+              >
+                <span>{sec.label}</span>
+                <a
+                  href={buildUrl("", sec.id)}
+                  onClick={(e) => {
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                    e.preventDefault();
+                    navigate("", sec.id);
+                    window.scrollTo({ top: 0 });
+                  }}
+                  className={`shrink-0 font-sans font-normal ${linkClass}`}
+                >
+                  View all {fmt(sec.total)} →
+                </a>
+              </h2>
+              <SkillList items={sec.items} showCategory={false} />
+            </section>
+          ))}
+        </>
+      ) : res.error && current ? (
         <div className="border-b border-line py-10 text-center">
-          <p className="text-muted">No skills match “{q}”.</p>
+          <p className="text-muted">Couldn&apos;t load results. Try again.</p>
           <button
             type="button"
-            onClick={() => onClear?.()}
-            className="mt-3 rounded text-sm text-terracotta hover:text-terracotta-hover"
+            onClick={() => setRes((prev) => ({ ...prev, key: "", error: false }))}
+            className={`mt-3 ${linkClass}`}
           >
+            Try again
+          </button>
+        </div>
+      ) : loading && res.items.length === 0 ? (
+        <p className="border-b border-line py-10 text-center text-muted">Loading…</p>
+      ) : current && res.total === 0 ? (
+        <div className="border-b border-line py-10 text-center">
+          <p className="text-muted">
+            No skills match “{query}”{cat ? ` in ${CATEGORY_LABELS[cat]}` : ""}.
+          </p>
+          <button type="button" onClick={() => navigate("", null)} className={`mt-3 ${linkClass}`}>
             Clear search
           </button>
         </div>
       ) : (
-        CATEGORIES.map((c) => {
-          const rows = byCategory.get(c.id);
-          if (!rows) return null;
-          const showAll = filtered || expanded.has(c.id);
-          const visible = showAll ? rows : rows.slice(0, PREVIEW_ROWS);
-          return (
-            <section key={c.id} aria-labelledby={`cat-${c.id}`} className="mt-10">
-              <h2
-                id={`cat-${c.id}`}
-                className="flex items-baseline justify-between border-b border-line pb-2 font-serif text-xl font-semibold"
-              >
-                <span>{c.label}</span>
-                <span className="font-sans text-sm font-normal text-muted">
-                  {numberFormat.format(rows.length)}
-                </span>
-              </h2>
-              <ul className="divide-y divide-line border-b border-line">
-                {visible.map((s) => (
-                  <SkillRow key={s.id} skill={s} stars={stars[repoKey(s.repo)]} />
-                ))}
-              </ul>
-              {!showAll && rows.length > PREVIEW_ROWS && (
+        <div aria-busy={loading} className={loading ? "opacity-60 transition-opacity" : undefined}>
+          <SkillList items={res.items} showCategory />
+          {current && (
+            <div className="mt-4 flex flex-col items-center gap-3 text-sm text-muted">
+              <span>
+                Showing {fmt(res.items.length)} of {fmt(res.total)}
+              </span>
+              {res.items.length < res.total && (
                 <button
                   type="button"
-                  onClick={() => setExpanded((prev) => new Set(prev).add(c.id))}
-                  className="mt-3 rounded text-sm text-terracotta hover:text-terracotta-hover"
+                  onClick={loadMore}
+                  disabled={more.loading}
+                  className="rounded-full border border-line bg-surface px-4 py-2 text-ink hover:border-terracotta disabled:opacity-60"
                 >
-                  Show all {numberFormat.format(rows.length)}
+                  {more.loading ? "Loading…" : "Load more"}
                 </button>
               )}
-            </section>
-          );
-        })
+              {more.error && <span>Couldn&apos;t load results. Try again.</span>}
+            </div>
+          )}
+        </div>
       )}
     </div>
-  );
-}
-
-function buildUrl(q: string, cat: CategoryId | null): string {
-  const params = new URLSearchParams();
-  if (q) params.set("q", q);
-  if (cat) params.set("cat", cat);
-  const s = params.toString();
-  return s ? `/?${s}` : "/";
-}
-
-export function Catalog({ stars }: { stars: Record<string, number | null> }) {
-  const router = useRouter();
-  const params = useSearchParams();
-  const q = params.get("q") ?? "";
-  const rawCat = params.get("cat");
-  const category = isCategoryId(rawCat) ? rawCat : null;
-  const inputRef = useRef<HTMLInputElement>(null);
-  const [isMac, setIsMac] = useState(false);
-
-  useEffect(() => {
-    // Platform is only known on the client; neutral hint until mounted.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setIsMac(/Mac|iPhone|iPad/i.test(navigator.platform));
-  }, []);
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        inputRef.current?.focus();
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  return (
-    <CatalogView
-      stars={stars}
-      query={q}
-      category={category}
-      kbdLabel={isMac ? "⌘ K" : "Ctrl K"}
-      inputRef={inputRef}
-      onQueryChange={(v) => router.replace(buildUrl(v, category), { scroll: false })}
-      onCategoryChange={(c) => router.replace(buildUrl(q, c), { scroll: false })}
-      onShortcut={(v) => router.push(buildUrl(v, null), { scroll: false })}
-      onClear={() => router.replace("/", { scroll: false })}
-    />
   );
 }

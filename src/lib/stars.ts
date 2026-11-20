@@ -1,87 +1,82 @@
-// Server-only: import this module from server components only (it reads
-// process.env.GITHUB_TOKEN). Never import it from a "use client" file.
-import type { RepoRef } from "@/data/catalog";
+// Server-only: reads process.env.GITHUB_TOKEN. Never import from a "use client" file.
+import type { RepoRef } from "./categories";
+import { repoKey } from "./categories";
 
-/** Star counts are cached and refreshed at most once per hour. */
+/** Live star counts are cached by the fetch cache for an hour. */
 export const STAR_REVALIDATE_SECONDS = 3600;
+/** Repositories per GraphQL query (one alias each). */
+export const GRAPHQL_BATCH = 100;
+const TIMEOUT_MS = 8000;
 
-/** GitHub search caps query length; keep each `q` at or under this. */
-export const MAX_QUERY_LENGTH = 250;
+export type RepoStars = RepoRef & { stars: number };
 
-const lastKnown = new Map<string, number>();
-
-/** Split keys into `repo:a/b repo:c/d` queries of at most MAX_QUERY_LENGTH chars. */
-export function chunkQueries(keys: string[]): string[] {
-  const out: string[] = [];
-  let cur = "";
-  for (const k of keys) {
-    const term = `repo:${k}`;
-    const next = cur ? `${cur} ${term}` : term;
-    if (cur && next.length > MAX_QUERY_LENGTH) {
-      out.push(cur);
-      cur = term;
-    } else {
-      cur = next;
-    }
-  }
-  if (cur) out.push(cur);
-  return out;
+/** True when a GITHUB_TOKEN is configured, i.e. stars are refreshed hourly. */
+export function hasLiveStars(): boolean {
+  return Boolean(process.env.GITHUB_TOKEN);
 }
 
-async function fetchChunk(q: string): Promise<Map<string, number>> {
+export function buildStarsQuery(repos: readonly RepoRef[]): string {
+  const fields = repos.map(
+    (r, i) =>
+      `r${i}: repository(owner: ${JSON.stringify(r.owner)}, name: ${JSON.stringify(r.name)}) { stargazerCount }`,
+  );
+  return `query {\n${fields.join("\n")}\n}`;
+}
+
+async function fetchChunk(repos: readonly RepoRef[], token: string): Promise<(number | null)[]> {
   const base = process.env.GITHUB_API_BASE || "https://api.github.com";
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "skill-stacks",
-  };
-  if (process.env.GITHUB_TOKEN) {
-    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
-  }
-  const params = new URLSearchParams({ q, per_page: "100" });
-  const res = await fetch(`${base}/search/repositories?${params}`, {
-    headers,
+  const res = await fetch(`${base}/graphql`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "User-Agent": "skill-stacks",
+    },
+    body: JSON.stringify({ query: buildStarsQuery(repos) }),
     next: { revalidate: STAR_REVALIDATE_SECONDS },
-    signal: AbortSignal.timeout(6000),
-  });
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  } as RequestInit);
   if (!res.ok) throw new Error(`status ${res.status}`);
-  const json: unknown = await res.json();
-  const items = (json as { items?: unknown } | null)?.items;
-  if (!Array.isArray(items)) throw new Error("bad payload");
-  const found = new Map<string, number>();
-  for (const item of items) {
-    const { full_name, stargazers_count } = (item ?? {}) as {
-      full_name?: unknown;
-      stargazers_count?: unknown;
-    };
-    if (typeof full_name === "string" && typeof stargazers_count === "number") {
-      found.set(full_name.toLowerCase(), stargazers_count);
-    }
-  }
-  return found;
+  const json = (await res.json()) as { data?: Record<string, unknown> | null } | null;
+  const data = json?.data ?? {};
+  return repos.map((_, i) => {
+    const v = (data[`r${i}`] as { stargazerCount?: unknown } | null | undefined)?.stargazerCount;
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  });
 }
 
-/** Keyed by lowercase `owner/name`. Never throws; null means unavailable. */
-export async function getStarCounts(
-  repos: RepoRef[],
-): Promise<Record<string, number | null>> {
-  const keys = [...new Set(repos.map((r) => `${r.owner}/${r.name}`.toLowerCase()))];
-  const result: Record<string, number | null> = {};
+/**
+ * Star counts keyed by lowercase `owner/name`. Without GITHUB_TOKEN this is the
+ * snapshot and no request is made. With a token, counts come from GitHub GraphQL;
+ * any repository whose chunk fails or that is missing keeps its snapshot value.
+ * `live` is true when at least one chunk was answered. Never throws.
+ */
+export async function refreshStars(
+  repos: readonly RepoStars[],
+): Promise<{ stars: Record<string, number>; live: boolean }> {
+  const out: Record<string, number> = {};
+  for (const r of repos) out[repoKey(r)] = r.stars;
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) return { stars: out, live: false };
+  let live = false;
+
+  const chunks: RepoStars[][] = [];
+  for (let i = 0; i < repos.length; i += GRAPHQL_BATCH) {
+    chunks.push(repos.slice(i, i + GRAPHQL_BATCH));
+  }
   await Promise.all(
-    chunkQueries(keys).map(async (q) => {
-      const chunkKeys = q.split(" ").map((t) => t.slice("repo:".length));
-      let found: Map<string, number> | null = null;
+    chunks.map(async (chunk) => {
       try {
-        found = await fetchChunk(q);
+        const values = await fetchChunk(chunk, token);
+        live = true;
+        chunk.forEach((r, i) => {
+          const v = values[i];
+          if (v !== null) out[repoKey(r)] = v;
+        });
       } catch {
-        found = null;
-      }
-      for (const k of chunkKeys) {
-        const v = found?.get(k);
-        if (typeof v === "number") lastKnown.set(k, v);
-        result[k] = typeof v === "number" ? v : (lastKnown.get(k) ?? null);
+        // Keep snapshot values for this chunk.
       }
     }),
   );
-  return Object.fromEntries(keys.map((k) => [k, result[k] ?? null]));
+  return { stars: out, live };
 }
