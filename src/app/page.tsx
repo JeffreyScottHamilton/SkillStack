@@ -1,6 +1,8 @@
 import { Catalog } from "@/components/Catalog";
+import { PackGrid } from "@/components/PackGrid";
 import { PAGE_SIZE, isCategoryId } from "@/lib/categories";
 import { getHome, getLiveCatalog, starsLabel } from "@/lib/catalog.server";
+import { getPacks } from "@/lib/packs.server";
 import { searchSkills } from "@/lib/search";
 
 const numberFormat = new Intl.NumberFormat("en-US");
@@ -38,6 +40,7 @@ export default async function Home({ searchParams }: { searchParams: SearchParam
         initialResult={initialResult}
         home={getHome(catalog)}
         starsLabel={starsLabel(catalog)}
+        packs={<PackGrid packs={await getPacks()} />}
       />
     </>
   );

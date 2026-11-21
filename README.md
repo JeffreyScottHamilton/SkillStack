@@ -32,6 +32,10 @@ Node 22 is expected. Optionally copy `.env.example` to `.env.local` (see "Star c
 
 Claude Code looks for personal skills in `~/.claude/skills/<skill-name>/SKILL.md` and project skills in `.claude/skills/<skill-name>/SKILL.md`. See https://code.claude.com/docs/en/skills.
 
+## Packs
+
+`data/packs.json` defines 16 curated packs of 20 skills each (Developer, Video editor, Security, and so on). Skill ids are resolved against the catalog at request time, ids that are missing are skipped, and each pack has a page at `/packs/<slug>` whose rows link straight to GitHub.
+
 ## Data format and search
 
 The catalog lives in `data/catalog.json` (about 2.8 MB, about 1 MB gzipped). It is read only on the server by `src/lib/catalog.server.ts` and is never shipped to the browser. To stay small it is columnar:
